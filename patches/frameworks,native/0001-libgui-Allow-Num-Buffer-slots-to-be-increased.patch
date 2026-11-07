@@ -1,0 +1,46 @@
+From ca48523cafd9a05369103fb87854a071e832da9a Mon Sep 17 00:00:00 2001
+From: realahnet <syedmusicrealise@gmail.com>
+Date: Mon, 29 Jun 2026 01:00:41 +0500
+Subject: [PATCH 01/16] libgui: Allow Num Buffer slots to be increased
+
+* Oplus cam depends on this
+---
+ libs/gui/Android.bp                  | 5 ++++-
+ libs/ui/include/ui/BufferQueueDefs.h | 4 ++++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/libs/gui/Android.bp b/libs/gui/Android.bp
+index 1e17a57..f60e60a 100644
+--- a/libs/gui/Android.bp
++++ b/libs/gui/Android.bp
+@@ -540,7 +540,10 @@ cc_defaults {
+     cflags: [
+         "-Wall",
+         "-Werror",
+-    ],
++    ] + select(soong_config_variable("libgui", "num_buffer_slots"), {
++        any @ value: ["-DNUM_BUFFER_SLOTS_OVERRIDE=" + value],
++        default: [],
++    }),
+ 
+     cppflags: [
+         "-Wextra",
+diff --git a/libs/ui/include/ui/BufferQueueDefs.h b/libs/ui/include/ui/BufferQueueDefs.h
+index 0fecda9..5682400 100644
+--- a/libs/ui/include/ui/BufferQueueDefs.h
++++ b/libs/ui/include/ui/BufferQueueDefs.h
+@@ -22,7 +22,11 @@ namespace android {
+         // BufferQueue will keep track of at most this value of buffers.
+         // Attempts at runtime to increase the number of buffers past this
+         // will fail.
++#ifdef NUM_BUFFER_SLOTS_OVERRIDE
++        static constexpr int NUM_BUFFER_SLOTS = NUM_BUFFER_SLOTS_OVERRIDE;
++#else
+         static constexpr int NUM_BUFFER_SLOTS = 64;
++#endif
+ 
+         enum {
+             // A flag returned by dequeueBuffer when the client needs to call
+-- 
+2.47.3
+

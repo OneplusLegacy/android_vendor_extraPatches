@@ -1,0 +1,453 @@
+From cc7a954082ea4f8d4e1bf33cc3c1b3affe9914aa Mon Sep 17 00:00:00 2001
+From: Hecheng Yu <kde-yyds@qq.com>
+Date: Sun, 31 May 2026 19:02:32 +0800
+Subject: [PATCH 8/8] CameraService: Add OnePlus camera extension support for
+ zoom
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add necessary stubs and hooks to load and delegate Binder transactions
+to the proprietary OnePlus camera extension library (libcsextimpl.so).
+
+- Add empty ICameraServiceExt constructor/destructor to satisfy linker
+  symbols required by the extension.
+- Implement CameraServiceExtFactory to dlopen libcsextimpl.so, resolve
+  getExtFactoryImpl and onTransact symbols, and provide a function table
+  as expected by OxygenOS.
+- Hook CameraService::onTransact: delegate all non‑shell commands to
+  CameraServiceExtFactory::onTransact, which calls the extension's
+  onTransact method. This handles transaction 10015 (CMD_UI_EVENT) used
+  for zoom.
+- Add missing CameraSessionStats constants (CAMERA_STATE_EXCEPTION,
+  CAMERA_STATE_SESSION_CONFIGURED, CAMERA_STATE_FIRST_FRAME_ARRIVED)
+  used by the extension.
+- Add OxygenOS‑compatible overload of collectReturnableOutputBuffers
+  to support the extension's buffer handling.
+- Add four‑parameter overload of CameraProviderManager::getCameraCharacteristics
+  to match the signature expected by the extension.
+
+Test: Camera zoom works on custom ROM with prebuilt libcsextimpl.so.
+---
+ camera/CameraSessionStats.cpp                      |    4 +
+ camera/include/camera/CameraSessionStats.h         |    3
+ services/camera/libcameraservice/Android.bp        |    3
+ services/camera/libcameraservice/CameraService.cpp |    8 +
+ .../common/CameraProviderManager.cpp               |    9 +
+ .../common/CameraProviderManager.h                 |    2
+ .../device3/Camera3OutputUtils.cpp                 |   32 +++++
+ .../libcameraservice/device3/Camera3OutputUtils.h  |   19 +++
+ .../ext/CameraServiceExtFactory.cpp                |  124 ++++++++++++++++++++
+ .../libcameraservice/ext/ICameraServiceExt.cpp     |   16 +++
+ .../ext/include/CameraServiceExtFactory.h          |   27 ++++
+ .../ext/include/ICameraServiceExt.h                |   14 ++
+ 12 files changed, 260 insertions(+), 1 deletion(-)
+ create mode 100644 services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+ create mode 100644 services/camera/libcameraservice/ext/ICameraServiceExt.cpp
+ create mode 100644 services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
+ create mode 100644 services/camera/libcameraservice/ext/include/ICameraServiceExt.h
+
+diff --git a/camera/CameraSessionStats.cpp b/camera/CameraSessionStats.cpp
+index cd5cf64..324df71 100644
+--- a/camera/CameraSessionStats.cpp
++++ b/camera/CameraSessionStats.cpp
+@@ -284,6 +284,10 @@ const int CameraSessionStats::CAMERA_STATE_ACTIVE = 1;
+ const int CameraSessionStats::CAMERA_STATE_IDLE = 2;
+ const int CameraSessionStats::CAMERA_STATE_CLOSED = 3;
+ 
++const int CameraSessionStats::CAMERA_STATE_EXCEPTION = 4;
++const int CameraSessionStats::CAMERA_STATE_SESSION_CONFIGURED = 5;
++const int CameraSessionStats::CAMERA_STATE_FIRST_FRAME_ARRIVED = 6;
++
+ const int CameraSessionStats::CAMERA_FACING_BACK = 0;
+ const int CameraSessionStats::CAMERA_FACING_FRONT = 1;
+ const int CameraSessionStats::CAMERA_FACING_EXTERNAL = 2;
+diff --git a/camera/include/camera/CameraSessionStats.h b/camera/include/camera/CameraSessionStats.h
+index effab06..23ba2d2 100644
+--- a/camera/include/camera/CameraSessionStats.h
++++ b/camera/include/camera/CameraSessionStats.h
+@@ -121,6 +121,9 @@ public:
+     static const int CAMERA_STATE_ACTIVE;
+     static const int CAMERA_STATE_IDLE;
+     static const int CAMERA_STATE_CLOSED;
++    static const int CAMERA_STATE_EXCEPTION;
++    static const int CAMERA_STATE_SESSION_CONFIGURED;
++    static const int CAMERA_STATE_FIRST_FRAME_ARRIVED;
+ 
+     /**
+      * Values for notifyCameraState facing
+diff --git a/services/camera/libcameraservice/Android.bp b/services/camera/libcameraservice/Android.bp
+index eb0d786..cd81458 100644
+--- a/services/camera/libcameraservice/Android.bp
++++ b/services/camera/libcameraservice/Android.bp
+@@ -213,6 +213,8 @@ cc_library {
+         "utils/LatencyHistogram.cpp",
+         "utils/Utils.cpp",
+         "utils/VirtualDeviceCameraIdMapper.cpp",
++        "ext/ICameraServiceExt.cpp",
++        "ext/CameraServiceExtFactory.cpp",
+     ],
+ 
+     header_libs: [
+@@ -235,6 +237,7 @@ cc_library {
+     include_dirs: [
+         "system/media/private/camera/include",
+         "frameworks/native/include/media/openmax",
++        "frameworks/av/services/camera/libcameraservice/ext/include",
+     ],
+ 
+     export_include_dirs: ["."],
+diff --git a/services/camera/libcameraservice/CameraService.cpp b/services/camera/libcameraservice/CameraService.cpp
+index a1eb497..ec6154b 100644
+--- a/services/camera/libcameraservice/CameraService.cpp
++++ b/services/camera/libcameraservice/CameraService.cpp
+@@ -90,6 +90,8 @@
+ #include "utils/TagMonitor.h"
+ #include "utils/Utils.h"
+ 
++#include "ext/include/CameraServiceExtFactory.h"
++
+ namespace {
+     const char* kActivityServiceName = "activity";
+     const char* kSensorPrivacyServiceName = "sensor_privacy";
+@@ -4132,6 +4134,7 @@ void CameraService::logServiceError(const std::string &msg, int errorCode) {
+ status_t CameraService::onTransact(uint32_t code, const Parcel& data, Parcel* reply,
+         uint32_t flags) {
+ 
++    ALOGI("CameraService::onTransact: code=0x%x (%d)", code, code);
+     // Permission checks
+     switch (code) {
+         case SHELL_COMMAND_TRANSACTION: {
+@@ -4160,6 +4163,11 @@ status_t CameraService::onTransact(uint32_t code, const Parcel& data, Parcel* re
+         }
+     }
+ 
++    // Let the extension handle it first
++    if (CameraServiceExtFactory::onTransact(code, data, reply, flags) == 0) {
++        return NO_ERROR;
++    }
++
+     return BnCameraService::onTransact(code, data, reply, flags);
+ }
+ 
+diff --git a/services/camera/libcameraservice/common/CameraProviderManager.cpp b/services/camera/libcameraservice/common/CameraProviderManager.cpp
+index fcd1843..b6d5628 100644
+--- a/services/camera/libcameraservice/common/CameraProviderManager.cpp
++++ b/services/camera/libcameraservice/common/CameraProviderManager.cpp
+@@ -59,6 +59,9 @@
+ 
+ #include "common/CameraProviderExtension.h"
+ 
++#include "CameraServiceExtFactory.h"
++#include "ICameraServiceExt.h"
++
+ namespace android {
+ 
+ using namespace ::android::hardware::camera;
+@@ -546,7 +549,11 @@ status_t CameraProviderManager::getCameraCharacteristics(const std::string &id,
+     std::lock_guard<std::mutex> lock(mInterfaceMutex);
+     return getCameraCharacteristicsLocked(id, overrideForPerfClass, characteristics, compatInfo);
+ }
+-
++status_t CameraProviderManager::getCameraCharacteristics( const std::string &id, bool overrideForPerfClass,
++        CameraMetadata* characteristics, int /*unused*/) const {
++    return getCameraCharacteristics(id, overrideForPerfClass, characteristics,
++            CameraCompatibilityInfo());
++}
+ status_t CameraProviderManager::getHighestSupportedVersion(const std::string &id,
+         hardware::hidl_version *v, IPCTransport *transport) {
+     if (v == nullptr || transport == nullptr) {
+diff --git a/services/camera/libcameraservice/common/CameraProviderManager.h b/services/camera/libcameraservice/common/CameraProviderManager.h
+index 6af6c6f..2c46341 100644
+--- a/services/camera/libcameraservice/common/CameraProviderManager.h
++++ b/services/camera/libcameraservice/common/CameraProviderManager.h
+@@ -316,6 +316,8 @@ public:
+     status_t getCameraCharacteristics(const std::string &id,
+             bool overrideForPerfClass, CameraMetadata* characteristics,
+             const CameraCompatibilityInfo& compatInfo) const;
++    status_t getCameraCharacteristics(const std::string &id, bool overrideForPerfClass,
++            CameraMetadata* characteristics, int) const;
+ 
+     status_t isConcurrentSessionConfigurationSupported(
+             const std::vector<hardware::camera2::utils::CameraIdAndSessionConfiguration>
+diff --git a/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp b/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp
+index ddcd9de..502ab24 100644
+--- a/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp
++++ b/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp
+@@ -1295,6 +1295,38 @@ void updateInflightRequestForConcurrentReadersLocked(
+     r.resultExtras.multiResConcurrentReadersStart = msg.multi_res_concurrent_readers_msg;
+ }
+ 
++void collectReturnableOutputBuffers(
++        bool useHalBufManager,
++        const std::set<int32_t>& halBufferManagedStreams,
++        sp<NotificationListener> listener,
++        const camera_stream_buffer_t* outputBuffers,
++        size_t numBuffers,
++        int64_t timestamp,
++        int64_t readoutTimestamp,
++        bool requested,
++        int64_t requestTimeNs,
++        SessionStatsBuilder& sessionStatsBuilder,
++        std::vector<BufferToReturn>* returnableBuffers,
++        bool timestampIncreasing,
++        const std::unordered_map<int32_t, std::vector<uint64_t>>& outputSurfaces,
++        const CaptureResultExtras& resultExtras,
++        ERROR_BUF_STRATEGY errorBufStrategy,
++        int /*extraParam*/) {
++
++    // Convert the OxygenOS map (uint64_t) to AOSP map (size_t)
++    std::unordered_map<int32_t, std::vector<size_t>> surfacesSizeT;
++    for (const auto& pair : outputSurfaces) {
++        surfacesSizeT[pair.first].assign(pair.second.begin(), pair.second.end());
++    }
++
++    // Call the AOSP overload (which takes sp<NotificationListener> by value)
++    collectReturnableOutputBuffers(useHalBufManager, halBufferManagedStreams, listener,
++            outputBuffers, numBuffers, timestamp, readoutTimestamp, requested, requestTimeNs,
++            sessionStatsBuilder, returnableBuffers, timestampIncreasing, surfacesSizeT,
++            resultExtras, errorBufStrategy, TransformationMap{});
++}
++
++
+ void notifyShutter(CaptureOutputStates& states, const camera_shutter_msg_t &msg) {
+     ATRACE_CALL();
+     ssize_t idx;
+diff --git a/services/camera/libcameraservice/device3/Camera3OutputUtils.h b/services/camera/libcameraservice/device3/Camera3OutputUtils.h
+index 4165a9e..0cd3c31 100644
+--- a/services/camera/libcameraservice/device3/Camera3OutputUtils.h
++++ b/services/camera/libcameraservice/device3/Camera3OutputUtils.h
+@@ -96,6 +96,25 @@ namespace camera3 {
+             ERROR_BUF_STRATEGY errorBufStrategy = ERROR_BUF_RETURN,
+             const TransformationMap &transform = TransformationMap{});
+ 
++    // OxygenOS-compatible overload for libcsextimpl.so
++    void collectReturnableOutputBuffers(
++        bool useHalBufManager,
++        const std::set<int32_t> &halBufferManagedStreams,
++        sp<NotificationListener> listener,
++        const camera_stream_buffer_t *outputBuffers,
++        size_t numBuffers,
++        nsecs_t timestamp,
++        nsecs_t readoutTimestamp,
++        bool requested,
++        nsecs_t requestTimeNs,
++        SessionStatsBuilder& sessionStatsBuilder,
++        std::vector<BufferToReturn> *returnableBuffers,
++        bool timestampIncreasing,
++        const std::unordered_map<int32_t, std::vector<uint64_t>> &outputSurfaces,
++        const CaptureResultExtras &resultExtras,
++        ERROR_BUF_STRATEGY errorBufStrategy,
++        int extraParam);
++
+     // helper function to collect the output buffers ready to be
+     // returned to output streams, and to remove these buffers from
+     // the inflight request's pending buffers vector.  Does not make
+diff --git a/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+new file mode 100644
+index 0000000..df12292
+--- /dev/null
++++ b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+@@ -0,0 +1,124 @@
++#include "CameraServiceExtFactory.h"
++#include <dlfcn.h>
++#include <log/log.h>
++#include <cutils/properties.h>
++
++namespace android {
++
++void* CameraServiceExtFactory::sFunctionTable = nullptr;
++void* CameraServiceExtFactory::sExtObject = nullptr;
++int (*CameraServiceExtFactory::sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t) = nullptr;
++bool CameraServiceExtFactory::sLoadAttempted = false;
++
++// The extension is opt-in at runtime. A failed load must leave cameraserver
++// fully functional: the stock OnePlus blob is built against an older
++// libcameraservice ABI and a bad link would otherwise take down Camera2 for
++// every app on the device, not just the OnePlus camera.
++static bool isExtEnabled() {
++    // Default on once the port is installed, but a single property can turn it
++    // off for a boot without rebuilding.
++    return property_get_bool("persist.vendor.camera.oneplus.ext", true);
++}
++
++void CameraServiceExtFactory::ensureLoaded() {
++    if (sFunctionTable != nullptr) return;
++    if (sLoadAttempted) return;
++    sLoadAttempted = true;
++
++    if (!isExtEnabled()) {
++        ALOGI("CameraServiceExtFactory: disabled by persist.vendor.camera.oneplus.ext");
++        return;
++    }
++
++    // Absolute path: dlopen() also searches the caller's working directory for
++    // relative names, which is not what we want here.
++    const char* libPath = "/system_ext/lib64/libcsextimpl.so";
++    void* handle = dlopen(libPath, RTLD_NOW);
++    if (handle == nullptr) {
++        ALOGE("CameraServiceExtFactory: dlopen(%s) failed: %s", libPath, dlerror());
++        return;
++    }
++    ALOGI("CameraServiceExtFactory: dlopen succeeded, handle=%p", handle);
++
++    typedef void* (*GetFactoryFunc)();
++    GetFactoryFunc getExtFactoryImpl = (GetFactoryFunc)dlsym(handle, "getExtFactoryImpl");
++    if (getExtFactoryImpl == nullptr) {
++        ALOGE("CameraServiceExtFactory: dlsym getExtFactoryImpl failed: %s", dlerror());
++        dlclose(handle);
++        return;
++    }
++    ALOGI("CameraServiceExtFactory: getExtFactoryImpl at %p", getExtFactoryImpl);
++
++    // Triple indirection as determined from logs: getExtFactoryImpl returns ptr to ptr to ptr to function
++    void* ptrToPtr = getExtFactoryImpl();
++    if (ptrToPtr == nullptr) {
++        ALOGE("CameraServiceExtFactory: getExtFactoryImpl returned null");
++        dlclose(handle);
++        return;
++    }
++
++    void* ptrToFunc = *(void**)ptrToPtr;
++    if (ptrToFunc == nullptr) {
++        ALOGE("CameraServiceExtFactory: first deref gave null");
++        dlclose(handle);
++        return;
++    }
++
++    void* actualFunc = *(void**)ptrToFunc;
++    if (actualFunc == nullptr) {
++        ALOGE("CameraServiceExtFactory: second deref gave null");
++        dlclose(handle);
++        return;
++    }
++    ALOGI("CameraServiceExtFactory: actual factory function at %p", actualFunc);
++
++    sFunctionTable = operator new(8);
++    *(void**)sFunctionTable = actualFunc;
++    ALOGI("CameraServiceExtFactory: function table at %p", sFunctionTable);
++
++    // Resolve onTransact (for direct call via vtable)
++    sOnTransactFunc = (int (*)(void*, uint32_t, const Parcel&, Parcel*, uint32_t))
++        dlsym(handle, "_ZN7android20CameraServiceExtImpl10onTransactEjRKNS_6ParcelEPS1_j");
++    if (sOnTransactFunc == nullptr) {
++        ALOGE("CameraServiceExtFactory: dlsym onTransact failed: %s", dlerror());
++    } else {
++        ALOGI("CameraServiceExtFactory: onTransact found at %p", sOnTransactFunc);
++    }
++}
++
++void* CameraServiceExtFactory::getInstance() {
++    ensureLoaded();
++    return sFunctionTable;   // may be null
++}
++
++int CameraServiceExtFactory::onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) {
++    ensureLoaded();
++    if (sExtObject == nullptr) {
++        if (sFunctionTable == nullptr) {
++            ALOGE("CameraServiceExtFactory::onTransact: extension not loaded");
++            return -1;
++        }
++        void* actualFunc = *(void**)sFunctionTable;
++        if (actualFunc == nullptr) return -1;
++        typedef void* (*GetObjectFunc)();
++        sExtObject = ((GetObjectFunc)actualFunc)();
++        if (sExtObject == nullptr) {
++            ALOGE("CameraServiceExtFactory: factory returned null");
++            return -1;
++        }
++        ALOGI("CameraServiceExtFactory: real extension object at %p", sExtObject);
++    }
++
++    if (sOnTransactFunc == nullptr) {
++        ALOGE("CameraServiceExtFactory::onTransact: no function pointer");
++        return -1;
++    }
++    return sOnTransactFunc(sExtObject, code, data, reply, flags);
++}
++
++CameraServiceExtFactory::~CameraServiceExtFactory() {
++    // No cleanup needed – the extension library manages its own singleton.
++    ALOGV("CameraServiceExtFactory destructor (stub)");
++}
++
++} // namespace android
+diff --git a/services/camera/libcameraservice/ext/ICameraServiceExt.cpp b/services/camera/libcameraservice/ext/ICameraServiceExt.cpp
+new file mode 100644
+index 0000000..d691995
+--- /dev/null
++++ b/services/camera/libcameraservice/ext/ICameraServiceExt.cpp
+@@ -0,0 +1,16 @@
++#include "ICameraServiceExt.h"
++#include <log/log.h>
++
++namespace android {
++
++    ICameraServiceExt::ICameraServiceExt() {
++        // Do nothing – the real object will call this as part of its construction.
++        // No member initialisation to avoid corrupting the real object's memory.
++        ALOGV("ICameraServiceExt constructor (stub, no-op)");
++    }
++
++    ICameraServiceExt::~ICameraServiceExt() {
++        ALOGV("ICameraServiceExt destructor (stub, no-op)");
++    }
++
++} // namespace android
+diff --git a/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h b/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
+new file mode 100644
+index 0000000..8cd6729
+--- /dev/null
++++ b/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <binder/Parcel.h>
++
++namespace android {
++
++// Forward declaration – we will not define this class
++class ICameraServiceExt;
++
++class CameraServiceExtFactory {
++public:
++    // Returns a pointer to a function table (as required by OxygenOS)
++    static void* getInstance();
++    static int onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags);
++    virtual ~CameraServiceExtFactory();
++
++private:
++    static void ensureLoaded();
++    static void* sFunctionTable;   // pointer to function pointer
++    static void* sExtObject;        // the real extension object (as void*)
++    static int (*sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t);
++    // Set on the first ensureLoaded() call, successful or not, so a missing or
++    // incompatible library is not reopened on every transaction.
++    static bool sLoadAttempted;
++};
++
++} // namespace android
+diff --git a/services/camera/libcameraservice/ext/include/ICameraServiceExt.h b/services/camera/libcameraservice/ext/include/ICameraServiceExt.h
+new file mode 100644
+index 0000000..daf72d5
+--- /dev/null
++++ b/services/camera/libcameraservice/ext/include/ICameraServiceExt.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++namespace android {
++
++    // Empty placeholder class – no members, no base classes.
++    // The real implementation from the extension library will provide its own.
++    class ICameraServiceExt {
++    public:
++        ICameraServiceExt();
++        ~ICameraServiceExt();
++        // No other methods – the real object's vtable will be used.
++    };
++
++} // namespace android
+-- 
+2.47.3
+
