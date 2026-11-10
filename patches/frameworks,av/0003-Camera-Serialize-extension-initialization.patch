@@ -1,0 +1,259 @@
+From 36074c55b6ac77e21ba6c04735244b3477ac8b7e Mon Sep 17 00:00:00 2001
+From: RobertGarciaa <chae0218@naver.com>
+Date: Wed, 11 Nov 2026 00:41:35 +0900
+Subject: [PATCH] camera: Serialize stock extension initialization and preserve
+ Binder errors
+
+Resolve the exported ExtFactory method with an explicit this argument instead of fabricating a function table and invoking a member without its object. Serialize initialization and blob singleton construction with call_once, publishing only complete state.
+
+The pinned 7 Pro blob handles exactly 10001..10011. Keep normal Camera2 and other transactions out of its parser, preserve extension error statuses, and remove unconditional per-transaction logging. Contrary to the original patch description, this stock blob does not implement transaction 10015; this patch does not invent that protocol or certify private camera object layouts.
+
+Test: six fake-loader scenarios with 32 simultaneous callers each, argument identity, permission-error preservation and normal-transaction isolation. Syntax-checked both modified ARM64 translation units with existing CFI build flags. No full ROM build or device capture claim.
+---
+ .../camera/libcameraservice/CameraService.cpp |   9 +-
+ .../ext/CameraServiceExtFactory.cpp           | 150 ++++++------------
+ .../ext/include/CameraServiceExtFactory.h     |  15 +-
+ 3 files changed, 60 insertions(+), 114 deletions(-)
+
+diff --git a/services/camera/libcameraservice/CameraService.cpp b/services/camera/libcameraservice/CameraService.cpp
+index ec6154b..85fe863 100644
+--- a/services/camera/libcameraservice/CameraService.cpp
++++ b/services/camera/libcameraservice/CameraService.cpp
+@@ -4134,7 +4134,6 @@ void CameraService::logServiceError(const std::string &msg, int errorCode) {
+ status_t CameraService::onTransact(uint32_t code, const Parcel& data, Parcel* reply,
+         uint32_t flags) {
+ 
+-    ALOGI("CameraService::onTransact: code=0x%x (%d)", code, code);
+     // Permission checks
+     switch (code) {
+         case SHELL_COMMAND_TRANSACTION: {
+@@ -4163,9 +4162,11 @@ status_t CameraService::onTransact(uint32_t code, const Parcel& data, Parcel* re
+         }
+     }
+ 
+-    // Let the extension handle it first
+-    if (CameraServiceExtFactory::onTransact(code, data, reply, flags) == 0) {
+-        return NO_ERROR;
++    // Preserve extension permission/parcel errors; only an unhandled transaction
++    // may fall through to the platform Binder implementation.
++    status_t extensionStatus = CameraServiceExtFactory::onTransact(code, data, reply, flags);
++    if (extensionStatus != UNKNOWN_TRANSACTION) {
++        return extensionStatus;
+     }
+ 
+     return BnCameraService::onTransact(code, data, reply, flags);
+diff --git a/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+index f6d887a..ccc1326 100644
+--- a/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
++++ b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+@@ -29,120 +29,68 @@ uid_t CameraThreadState::getCallingUid() {
+     return IPCThreadState::self()->getCallingUid();
+ }
+ 
+-void* CameraServiceExtFactory::sFunctionTable = nullptr;
++std::once_flag CameraServiceExtFactory::sLoadOnce;
++void* CameraServiceExtFactory::sFactory = nullptr;
+ void* CameraServiceExtFactory::sExtObject = nullptr;
+ int (*CameraServiceExtFactory::sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t) = nullptr;
+-bool CameraServiceExtFactory::sLoadAttempted = false;
+-
+-// The extension is opt-in at runtime. A failed load must leave cameraserver
+-// fully functional: the stock OnePlus blob is built against an older
+-// libcameraservice ABI and a bad link would otherwise take down Camera2 for
+-// every app on the device, not just the OnePlus camera.
+-static bool isExtEnabled() {
+-    // Default on once the port is installed, but a single property can turn it
+-    // off for a boot without rebuilding.
+-    return property_get_bool("persist.vendor.camera.oneplus.ext", true);
+-}
+ 
+ void CameraServiceExtFactory::ensureLoaded() {
+-    if (sFunctionTable != nullptr) return;
+-    if (sLoadAttempted) return;
+-    sLoadAttempted = true;
+-
+-    if (!isExtEnabled()) {
+-        ALOGI("CameraServiceExtFactory: disabled by persist.vendor.camera.oneplus.ext");
+-        return;
+-    }
+-
+-    // Absolute path: dlopen() also searches the caller's working directory for
+-    // relative names, which is not what we want here.
+-    const char* libPath = "/system_ext/lib64/libcsextimpl.so";
+-    void* handle = dlopen(libPath, RTLD_NOW);
+-    if (handle == nullptr) {
+-        ALOGE("CameraServiceExtFactory: dlopen(%s) failed: %s", libPath, dlerror());
+-        return;
+-    }
+-    ALOGI("CameraServiceExtFactory: dlopen succeeded, handle=%p", handle);
+-
+-    typedef void* (*GetFactoryFunc)();
+-    GetFactoryFunc getExtFactoryImpl = (GetFactoryFunc)dlsym(handle, "getExtFactoryImpl");
+-    if (getExtFactoryImpl == nullptr) {
+-        ALOGE("CameraServiceExtFactory: dlsym getExtFactoryImpl failed: %s", dlerror());
+-        dlclose(handle);
+-        return;
+-    }
+-    ALOGI("CameraServiceExtFactory: getExtFactoryImpl at %p", getExtFactoryImpl);
+-
+-    // Triple indirection as determined from logs: getExtFactoryImpl returns ptr to ptr to ptr to function
+-    void* ptrToPtr = getExtFactoryImpl();
+-    if (ptrToPtr == nullptr) {
+-        ALOGE("CameraServiceExtFactory: getExtFactoryImpl returned null");
+-        dlclose(handle);
+-        return;
+-    }
+-
+-    void* ptrToFunc = *(void**)ptrToPtr;
+-    if (ptrToFunc == nullptr) {
+-        ALOGE("CameraServiceExtFactory: first deref gave null");
+-        dlclose(handle);
+-        return;
+-    }
+-
+-    void* actualFunc = *(void**)ptrToFunc;
+-    if (actualFunc == nullptr) {
+-        ALOGE("CameraServiceExtFactory: second deref gave null");
+-        dlclose(handle);
+-        return;
+-    }
+-    ALOGI("CameraServiceExtFactory: actual factory function at %p", actualFunc);
+-
+-    sFunctionTable = operator new(8);
+-    *(void**)sFunctionTable = actualFunc;
+-    ALOGI("CameraServiceExtFactory: function table at %p", sFunctionTable);
+-
+-    // Resolve onTransact (for direct call via vtable)
+-    sOnTransactFunc = (int (*)(void*, uint32_t, const Parcel&, Parcel*, uint32_t))
+-        dlsym(handle, "_ZN7android20CameraServiceExtImpl10onTransactEjRKNS_6ParcelEPS1_j");
+-    if (sOnTransactFunc == nullptr) {
+-        ALOGE("CameraServiceExtFactory: dlsym onTransact failed: %s", dlerror());
+-    } else {
+-        ALOGI("CameraServiceExtFactory: onTransact found at %p", sOnTransactFunc);
+-    }
++    std::call_once(sLoadOnce, [] {
++        if (!property_get_bool("persist.vendor.camera.oneplus.ext", true)) {
++            ALOGI("OnePlus camera extension disabled");
++            return;
++        }
++        void* handle = dlopen("/system_ext/lib64/libcsextimpl.so", RTLD_NOW | RTLD_LOCAL);
++        if (handle == nullptr) {
++            ALOGE("Cannot load OnePlus camera extension: %s", dlerror());
++            return;
++        }
++        using GetFactory = void* (*)();
++        // A non-static C++ method needs the factory as its implicit this argument.
++        using GetExtension = void* (*)(void*);
++        using OnTransact = int (*)(void*, uint32_t, const Parcel&, Parcel*, uint32_t);
++        auto getFactory = reinterpret_cast<GetFactory>(dlsym(handle, "getExtFactoryImpl"));
++        auto getExtension = reinterpret_cast<GetExtension>(dlsym(handle,
++                "_ZN7android10ExtFactory19getCameraServiceExtEv"));
++        auto transact = reinterpret_cast<OnTransact>(dlsym(handle,
++                "_ZN7android20CameraServiceExtImpl10onTransactEjRKNS_6ParcelEPS1_j"));
++        if (getFactory == nullptr || getExtension == nullptr || transact == nullptr) {
++            ALOGE("OnePlus camera extension exports are incomplete");
++            dlclose(handle);
++            return;
++        }
++        void* factory = getFactory();
++        void* extension = factory != nullptr ? getExtension(factory) : nullptr;
++        if (extension == nullptr) {
++            ALOGE("OnePlus camera extension factory returned null");
++            dlclose(handle);
++            return;
++        }
++        // Publish only a complete result. All callers synchronize through call_once;
++        // concurrent Binder calls must not race the blob's singleton constructors.
++        sFactory = factory;
++        sExtObject = extension;
++        sOnTransactFunc = transact;
++        // Keep the library loaded: these objects and callbacks belong to its singleton.
++        ALOGI("OnePlus camera extension initialized");
++    });
+ }
+ 
+ void* CameraServiceExtFactory::getInstance() {
+     ensureLoaded();
+-    return sFunctionTable;   // may be null
++    return sFactory;
+ }
+ 
+-int CameraServiceExtFactory::onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) {
++int CameraServiceExtFactory::onTransact(uint32_t code, const Parcel& data,
++        Parcel* reply, uint32_t flags) {
++    // The pinned 7 Pro blob dispatches exactly 10001..10011 (subtract 10001,
++    // unsigned compare with 10). Leave all AOSP and other OEM transactions intact.
++    if (code < 10001 || code > 10011) return UNKNOWN_TRANSACTION;
+     ensureLoaded();
+-    if (sExtObject == nullptr) {
+-        if (sFunctionTable == nullptr) {
+-            ALOGE("CameraServiceExtFactory::onTransact: extension not loaded");
+-            return -1;
+-        }
+-        void* actualFunc = *(void**)sFunctionTable;
+-        if (actualFunc == nullptr) return -1;
+-        typedef void* (*GetObjectFunc)();
+-        sExtObject = ((GetObjectFunc)actualFunc)();
+-        if (sExtObject == nullptr) {
+-            ALOGE("CameraServiceExtFactory: factory returned null");
+-            return -1;
+-        }
+-        ALOGI("CameraServiceExtFactory: real extension object at %p", sExtObject);
+-    }
+-
+-    if (sOnTransactFunc == nullptr) {
+-        ALOGE("CameraServiceExtFactory::onTransact: no function pointer");
+-        return -1;
+-    }
++    if (sExtObject == nullptr || sOnTransactFunc == nullptr) return UNKNOWN_TRANSACTION;
+     return sOnTransactFunc(sExtObject, code, data, reply, flags);
+ }
+ 
+-CameraServiceExtFactory::~CameraServiceExtFactory() {
+-    // No cleanup needed – the extension library manages its own singleton.
+-    ALOGV("CameraServiceExtFactory destructor (stub)");
+-}
++CameraServiceExtFactory::~CameraServiceExtFactory() = default;
+ 
+ } // namespace android
+diff --git a/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h b/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
+index 8cd6729..b5dbfed 100644
+--- a/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
++++ b/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
+@@ -1,27 +1,24 @@
+ #pragma once
+ 
+ #include <binder/Parcel.h>
++#include <utils/Errors.h>
++#include <mutex>
+ 
+ namespace android {
+ 
+-// Forward declaration – we will not define this class
+-class ICameraServiceExt;
+-
+ class CameraServiceExtFactory {
+ public:
+-    // Returns a pointer to a function table (as required by OxygenOS)
++    // Returns the actual stock factory object, owned by the loaded library.
+     static void* getInstance();
+     static int onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags);
+     virtual ~CameraServiceExtFactory();
+ 
+ private:
+     static void ensureLoaded();
+-    static void* sFunctionTable;   // pointer to function pointer
+-    static void* sExtObject;        // the real extension object (as void*)
++    static std::once_flag sLoadOnce;
++    static void* sFactory;
++    static void* sExtObject;
+     static int (*sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t);
+-    // Set on the first ensureLoaded() call, successful or not, so a missing or
+-    // incompatible library is not reopened on every transaction.
+-    static bool sLoadAttempted;
+ };
+ 
+ } // namespace android
+-- 
+2.56.0
+
