@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RobertGarciaa <chae0218@naver.com>
+Date: Tue, 10 Nov 2026 18:00:00 +0900
+Subject: [PATCH] core: Register the optional OPlus haptics wrapper
+
+The stock camera fetches linearmotor before shutter and lens-switch actions.
+Resolve the boot-jar compatibility client during registry initialization and
+construct its AOSP vibrator adapter for each context. Only clients explicitly opting in are registered. The optional reflection
+boundary avoids a compile-time dependency from the global framework onto a
+device namespace. Products without the client keep their service registry.
+
+Reference: frameworks/base 830e7aec3f4c and cf4649db9e0c (service registration
+and oplus-fwk client split); hardware/oplus 852ccb0 (AOSP client implementation).
+
+---
+diff --git a/core/java/android/app/SystemServiceRegistry.java b/core/java/android/app/SystemServiceRegistry.java
+--- a/core/java/android/app/SystemServiceRegistry.java
++++ b/core/java/android/app/SystemServiceRegistry.java
+@@ -2164,6 +2164,8 @@
+         }
+ 
+ 
++        registerOplusHapticsWrapper();
++
+         sInitializing = true;
+         try {
+             // Note: the following functions need to be @SystemApis, once they become mainline
+@@ -2398,6 +2400,40 @@
+         return serviceName;
+     }
+ 
++    /** Register an opt-in AOSP client without a framework/vendor build dependency. */
++    @RavenwoodKeep
++    @SuppressWarnings("unchecked")
++    private static void registerOplusHapticsWrapper() {
++        try {
++            final Class<?> type = Class.forName("com.oplus.os.LinearmotorVibrator", false,
++                    SystemServiceRegistry.class.getClassLoader());
++            if (!type.getField("AOSP_HAPTICS_COMPAT").getBoolean(null)) return;
++            final Class<?> binderType = Class.forName(
++                    "com.oplus.os.ILinearmotorVibratorService", false,
++                    SystemServiceRegistry.class.getClassLoader());
++            final java.lang.reflect.Constructor<?> constructor =
++                    type.getConstructor(Context.class, binderType);
++            registerService("linearmotor", (Class<Object>) type,
++                    new CachedServiceFetcher<Object>() {
++                        @Override
++                        public Object createService(ContextImpl context) {
++                            try {
++                                // The compatibility client uses AOSP VibratorManager;
++                                // it does not require an OPlus binder service.
++                                return constructor.newInstance(context.getOuterContext(), null);
++                            } catch (ReflectiveOperationException error) {
++                                throw new IllegalStateException("Cannot create OPlus haptics wrapper",
++                                        error);
++                            }
++                        }
++                    });
++        } catch (ClassNotFoundException | NoSuchFieldException optionalWrapperAbsent) {
++            // Products without the optional boot jar keep their normal services.
++        } catch (ReflectiveOperationException incompatibleWrapper) {
++            Slog.w(TAG, "Incompatible OPlus haptics wrapper", incompatibleWrapper);
++        }
++    }
++
+     /**
+      * Statically registers a system service with the context.
+      * This method must be called during static initialization only.
+-- 
+2.43.0
