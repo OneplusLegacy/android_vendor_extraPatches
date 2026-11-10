@@ -1,0 +1,51 @@
+From c26d7e809a21c6fa0374bba569532b45abcb3280 Mon Sep 17 00:00:00 2001
+From: RobertGarciaa <chae0218@naver.com>
+Date: Tue, 10 Nov 2026 09:07:51 +0900
+Subject: [PATCH] libbinder: Restore the three-argument permission check ABI
+
+Export the legacy checkPermission(String16, pid_t, uid_t) entry point under LIBBINDER and delegate to the current four-argument implementation with failure logging enabled. Replace the default bool argument with an explicit overload to keep three-argument source calls unambiguous.
+
+Preserve the real permission-controller result; no permissions or caller identity are synthesized.
+
+Test: compiled IServiceManager.cpp using its existing ARM64 flags, relinked libbinder in /tmp, and passed the original stock camera-extension ELF check with the temporary camera libraries. No full ROM build.
+Change-Id: Ib51601551034e794fc13d84a2c945392fce51ee8
+---
+ libs/binder/IServiceManager.cpp              | 4 ++++
+ libs/binder/include/binder/IServiceManager.h | 5 ++++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/libs/binder/IServiceManager.cpp b/libs/binder/IServiceManager.cpp
+index 0a564aa0fb..87aac16711 100644
+--- a/libs/binder/IServiceManager.cpp
++++ b/libs/binder/IServiceManager.cpp
+@@ -491,6 +491,10 @@ bool checkCallingPermission(const String16& permission, int32_t* outPid, int32_t
+     return checkPermission(permission, pid, uid);
+ }
+ 
++bool checkPermission(const String16& permission, pid_t pid, uid_t uid) {
++    return checkPermission(permission, pid, uid, /*logPermissionFailure*/true);
++}
++
+ bool checkPermission(const String16& permission, pid_t pid, uid_t uid, bool logPermissionFailure) {
+     [[clang::no_destroy]] static std::mutex gPermissionControllerLock;
+     [[clang::no_destroy]] static sp<IPermissionController> gPermissionController;
+diff --git a/libs/binder/include/binder/IServiceManager.h b/libs/binder/include/binder/IServiceManager.h
+index 713bddfe91..2c5aa85abc 100644
+--- a/libs/binder/include/binder/IServiceManager.h
++++ b/libs/binder/include/binder/IServiceManager.h
+@@ -249,8 +249,11 @@ LIBBINDER_EXPORTED void* openDeclaredPassthroughHal(const String16& interface,
+ LIBBINDER_EXPORTED bool checkCallingPermission(const String16& permission);
+ LIBBINDER_EXPORTED bool checkCallingPermission(const String16& permission, int32_t* outPid,
+                                                int32_t* outUid);
++// Keep the three-argument symbol required by older platform clients. The
++// explicit overload replaces the default argument without making calls ambiguous.
++LIBBINDER_EXPORTED bool checkPermission(const String16& permission, pid_t pid, uid_t uid);
+ LIBBINDER_EXPORTED bool checkPermission(const String16& permission, pid_t pid, uid_t uid,
+-                                        bool logPermissionFailure = true);
++                                        bool logPermissionFailure);
+ 
+ // ----------------------------------------------------------------------
+ // Trusty's definition of the socket APIs does not include sockaddr types
+-- 
+2.56.0
+

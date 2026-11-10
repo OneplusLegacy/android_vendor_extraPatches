@@ -1,0 +1,184 @@
+From edcd22d37edd46406751226e75fe10d2c8a63097 Mon Sep 17 00:00:00 2001
+From: RobertGarciaa <chae0218@naver.com>
+Date: Tue, 10 Nov 2026 09:07:50 +0900
+Subject: [PATCH] camera: Restore stock OnePlus extension ABI entry points
+
+Provide the legacy two-argument rotation transform and three-argument camera characteristics overloads by forwarding to the current implementations. Restore CameraThreadState caller IDs with the same Binder/HwBinder transport selection used by AttributionAndPermissionUtils.
+
+Bridge the old capture-result and buffer-return signatures to current helpers. Recover zoom-ratio mode from the live in-flight request, collect and finish real output buffers, and restore the caller-owned in-flight lock after delivering callbacks outside it. These adapters require framework-owned state; they do not recreate or certify Android 12 private class layouts.
+
+Test: compiled the modified ARM64 translation units with existing Android build flags, relinked only the three affected libraries in /tmp with one linker thread, and passed the original complete libcsextimpl check_elf_file invocation. No undefined-symbol allowance, prebuilt modification, full ROM build or device camera validation.
+Change-Id: Ie94221aeb8c1ad0dbc9ac6251ba8deb99c4c240b
+---
+ camera/CameraUtils.cpp                        |  6 +++
+ camera/include/camera/CameraUtils.h           |  4 ++
+ .../common/CameraProviderManager.cpp          |  6 +++
+ .../common/CameraProviderManager.h            |  3 ++
+ .../device3/Camera3OutputUtils.cpp            | 50 +++++++++++++++++++
+ .../ext/CameraServiceExtFactory.cpp           | 24 +++++++++
+ 6 files changed, 93 insertions(+)
+
+diff --git a/camera/CameraUtils.cpp b/camera/CameraUtils.cpp
+index ebb330554d..977b23fa3f 100644
+--- a/camera/CameraUtils.cpp
++++ b/camera/CameraUtils.cpp
+@@ -31,6 +31,12 @@ namespace android {
+ 
+ const char *kCameraServiceDisabledProperty = "config.disable_cameraservice";
+ 
++status_t CameraUtils::getRotationTransform(const CameraMetadata& staticInfo,
++        int32_t* transform) {
++    return getRotationTransform(staticInfo, OutputConfiguration::MIRROR_MODE_AUTO,
++            /*enableTransformInverseDisplay*/true, transform);
++}
++
+ status_t CameraUtils::getRotationTransform(const CameraMetadata& staticInfo,
+         int mirrorMode,  bool enableTransformInverseDisplay, /*out*/int32_t* transform) {
+     ALOGV("%s", __FUNCTION__);
+diff --git a/camera/include/camera/CameraUtils.h b/camera/include/camera/CameraUtils.h
+index 766cac1149..f5169da5fc 100644
+--- a/camera/include/camera/CameraUtils.h
++++ b/camera/include/camera/CameraUtils.h
+@@ -48,6 +48,10 @@ class CameraUtils {
+         static status_t getRotationTransform(const CameraMetadata& staticInfo,
+                 int mirrorMode, bool enableTransformInverseDisplay, /*out*/int32_t* transform);
+ 
++        // Stock OnePlus camera ABI: auto-mirror and inverse display transform.
++        static status_t getRotationTransform(const CameraMetadata& staticInfo,
++                /*out*/int32_t* transform);
++
+         /**
+          * Check if the image data is VideoNativeHandleMetadata, that contains a native handle.
+          */
+diff --git a/services/camera/libcameraservice/common/CameraProviderManager.cpp b/services/camera/libcameraservice/common/CameraProviderManager.cpp
+index b6d5628edb..2b696e256e 100644
+--- a/services/camera/libcameraservice/common/CameraProviderManager.cpp
++++ b/services/camera/libcameraservice/common/CameraProviderManager.cpp
+@@ -549,6 +549,12 @@ status_t CameraProviderManager::getCameraCharacteristics(const std::string &id,
+     std::lock_guard<std::mutex> lock(mInterfaceMutex);
+     return getCameraCharacteristicsLocked(id, overrideForPerfClass, characteristics, compatInfo);
+ }
++status_t CameraProviderManager::getCameraCharacteristics(const std::string &id,
++        bool overrideForPerfClass, CameraMetadata* characteristics) const {
++    return getCameraCharacteristics(id, overrideForPerfClass, characteristics,
++            CameraCompatibilityInfo());
++}
++
+ status_t CameraProviderManager::getCameraCharacteristics( const std::string &id, bool overrideForPerfClass,
+         CameraMetadata* characteristics, int /*unused*/) const {
+     return getCameraCharacteristics(id, overrideForPerfClass, characteristics,
+diff --git a/services/camera/libcameraservice/common/CameraProviderManager.h b/services/camera/libcameraservice/common/CameraProviderManager.h
+index 2c463411a4..569e37c9e9 100644
+--- a/services/camera/libcameraservice/common/CameraProviderManager.h
++++ b/services/camera/libcameraservice/common/CameraProviderManager.h
+@@ -318,6 +318,9 @@ public:
+             const CameraCompatibilityInfo& compatInfo) const;
+     status_t getCameraCharacteristics(const std::string &id, bool overrideForPerfClass,
+             CameraMetadata* characteristics, int) const;
++    // Stock OnePlus camera ABI without the newer compatibility argument.
++    status_t getCameraCharacteristics(const std::string &id, bool overrideForPerfClass,
++            CameraMetadata* characteristics) const;
+ 
+     status_t isConcurrentSessionConfigurationSupported(
+             const std::vector<hardware::camera2::utils::CameraIdAndSessionConfiguration>
+diff --git a/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp b/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp
+index 1263c7bd01..0aa6cf8262 100644
+--- a/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp
++++ b/services/camera/libcameraservice/device3/Camera3OutputUtils.cpp
+@@ -1665,5 +1665,55 @@ void flushInflightRequests(FlushInflightReqStates& states) {
+     }
+ }
+ 
++// Legacy entry points used by the stock OnePlus extension. These accept live
++// framework state and delegate to current helpers; they do not replace the
++// current CaptureOutputStates/InFlightRequest layouts with stock definitions.
++void sendCaptureResult(CaptureOutputStates& states, CameraMetadata& pendingMetadata,
++        CaptureResultExtras& resultExtras, CameraMetadata& collectedPartialResult,
++        uint32_t frameNumber, bool reprocess, bool zslStillCapture, bool rotateAndCropAuto,
++        const std::set<std::string>& cameraIdsWithZoom,
++        const std::vector<PhysicalCaptureResultInfo>& physicalMetadatas) {
++    const ssize_t index = states.inflightMap.indexOfKey(frameNumber);
++    const bool useZoomRatio = index >= 0
++            ? states.inflightMap.valueAt(index).useZoomRatio
++            : pendingMetadata.find(ANDROID_CONTROL_ZOOM_RATIO).count != 0;
++    sendCaptureResult(states, pendingMetadata, resultExtras, collectedPartialResult,
++            frameNumber, reprocess, zslStillCapture, rotateAndCropAuto,
++            cameraIdsWithZoom, useZoomRatio, physicalMetadatas);
++}
++
++void returnOutputBuffers(bool useHalBufManager, sp<NotificationListener> listener,
++        const camera_stream_buffer_t* outputBuffers, size_t numBuffers,
++        nsecs_t timestamp, bool requested, nsecs_t requestTimeNs,
++        SessionStatsBuilder& sessionStatsBuilder, bool timestampIncreasing,
++        const std::unordered_map<int32_t, std::vector<uint64_t>>& outputSurfaces,
++        const CaptureResultExtras& resultExtras, ERROR_BUF_STRATEGY errorBufStrategy) {
++    SurfaceMap surfaces;
++    for (const auto& [streamId, ids] : outputSurfaces) {
++        surfaces[streamId].assign(ids.begin(), ids.end());
++    }
++    std::vector<BufferToReturn> buffers;
++    collectReturnableOutputBuffers(useHalBufManager, /*halBufferManagedStreams*/{}, listener,
++            outputBuffers, numBuffers, timestamp, /*readoutTimestamp*/0, requested,
++            requestTimeNs, sessionStatsBuilder, &buffers, timestampIncreasing,
++            surfaces, resultExtras, errorBufStrategy, TransformationMap{});
++    finishReturningOutputBuffers(buffers, listener, sessionStatsBuilder);
++}
++
++void removeInFlightRequestIfReadyLocked(CaptureOutputStates& states, int index) {
++    std::vector<BufferToReturn> buffers;
++    removeInFlightRequestIfReadyLocked(states, index, &buffers);
++    if (!buffers.empty()) {
++        // The legacy caller owns inflightLock. Preserve that contract on return,
++        // but do not deliver buffers through two-way Binder calls under the lock.
++        struct RelockOnExit {
++            std::mutex& lock;
++            explicit RelockOnExit(std::mutex& mutex) : lock(mutex) { lock.unlock(); }
++            ~RelockOnExit() { lock.lock(); }
++        } unlocked(states.inflightLock);
++        finishReturningOutputBuffers(buffers, states.listener, states.sessionStatsBuilder);
++    }
++}
++
+ } // camera3
+ } // namespace android
+diff --git a/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+index 50dd4e0077..f6d887ac07 100644
+--- a/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
++++ b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+@@ -2,9 +2,33 @@
+ #include <dlfcn.h>
+ #include <log/log.h>
+ #include <cutils/properties.h>
++#include <binderthreadstate/CallerUtils.h>
++
+ 
+ namespace android {
+ 
++// Legacy stock ABI. Use the same Binder/HwBinder caller selection as the
++// current AttributionAndPermissionUtils implementation; never use our own UID.
++class CameraThreadState {
++public:
++    static pid_t getCallingPid();
++    static uid_t getCallingUid();
++};
++
++pid_t CameraThreadState::getCallingPid() {
++    if (getCurrentServingCall() == BinderCallType::HWBINDER) {
++        return hardware::IPCThreadState::self()->getCallingPid();
++    }
++    return IPCThreadState::self()->getCallingPid();
++}
++
++uid_t CameraThreadState::getCallingUid() {
++    if (getCurrentServingCall() == BinderCallType::HWBINDER) {
++        return hardware::IPCThreadState::self()->getCallingUid();
++    }
++    return IPCThreadState::self()->getCallingUid();
++}
++
+ void* CameraServiceExtFactory::sFunctionTable = nullptr;
+ void* CameraServiceExtFactory::sExtObject = nullptr;
+ int (*CameraServiceExtFactory::sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t) = nullptr;
+-- 
+2.56.0
+
