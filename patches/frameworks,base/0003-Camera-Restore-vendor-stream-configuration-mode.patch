@@ -1,0 +1,100 @@
+From 9de9dce85ef8d983aac9f806ec61cabd6110cc95 Mon Sep 17 00:00:00 2001
+From: RobertGarciaa <chae0218@naver.com>
+Date: Wed, 11 Nov 2026 12:00:17 +0900
+Subject: [PATCH] camera: Restore the stock vendor sensor-mode configuration
+ API
+
+Restore the hidden CameraDevice.setVendorStreamConfigMode(int) method used by the OnePlus video path. Preserve the stock sensor-index encoding in the upper 16 bits for both endConfigure and the new batched configureStreams API. Keep local normal/high-speed checks on the original session type and scope state to each device under its interface lock. Index zero preserves current behavior.
+
+The current device log shows the reflective call missing before HAL rejects video mode 0x8116. Stock CameraDeviceImpl stores customOpMode then ORs customOpMode << 16 into the wire operating mode. This fixes the missing transport link; it does not claim that every HAL/GPU crash is resolved. Both full modified Java sources compiled against the current framework. New ROM runtime validation remains required.
+---
+ .../hardware/camera2/CameraDevice.java        | 11 ++++++++++
+ .../camera2/impl/CameraDeviceImpl.java        | 20 ++++++++++++++++---
+ 2 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/core/java/android/hardware/camera2/CameraDevice.java b/core/java/android/hardware/camera2/CameraDevice.java
+index c10c944..fb19c5c 100644
+--- a/core/java/android/hardware/camera2/CameraDevice.java
++++ b/core/java/android/hardware/camera2/CameraDevice.java
+@@ -228,6 +228,17 @@ public abstract class CameraDevice implements AutoCloseable {
+     @NonNull
+     public abstract String getId();
+ 
++    /**
++     * Select the vendor sensor-mode index used by subsequent stream configurations.
++     * The stock OnePlus camera passes this separately from the session type.
++     *
++     * @hide
++     */
++    public void setVendorStreamConfigMode(int mode) {
++        throw new UnsupportedOperationException("Vendor stream configuration is not supported");
++    }
++
++
+     /**
+      * <p>Create a new camera capture session by providing the target output set of Surfaces to the
+      * camera device.</p>
+diff --git a/core/java/android/hardware/camera2/impl/CameraDeviceImpl.java b/core/java/android/hardware/camera2/impl/CameraDeviceImpl.java
+index c064035..27248be 100644
+--- a/core/java/android/hardware/camera2/impl/CameraDeviceImpl.java
++++ b/core/java/android/hardware/camera2/impl/CameraDeviceImpl.java
+@@ -141,6 +141,11 @@ public class CameraDeviceImpl extends CameraDevice
+ 
+     // Lock to synchronize cross-thread access to device public interface
+     final Object mInterfaceLock = new Object(); // access from this class and Session only!
++
++    // Stock OnePlus sensor-mode index; encoded above the low 16-bit session type.
++    // Guarded by mInterfaceLock, like the stream configuration that consumes it.
++    private int mVendorStreamConfigMode;
++
+     private final CameraDeviceCallbacks mCallbacks = new CameraDeviceCallbacks();
+ 
+     private long mFMQReader; // native fmq reader ptr
+@@ -600,6 +605,13 @@ public class CameraDeviceImpl extends CameraDevice
+ 
+     }
+ 
++    @Override
++    public void setVendorStreamConfigMode(int mode) {
++        synchronized (mInterfaceLock) {
++            mVendorStreamConfigMode = mode;
++        }
++    }
++
+     /**
+      * Attempt to configure the input and outputs; the device goes to idle and then configures the
+      * new input and outputs if possible.
+@@ -645,6 +657,8 @@ public class CameraDeviceImpl extends CameraDevice
+ 
+         synchronized(mInterfaceLock) {
+             checkIfCameraClosedOrInError();
++            // Match stock encoding without changing local normal/high-speed checks.
++            final int vendorOperatingMode = operatingMode | (mVendorStreamConfigMode << 16);
+             // Streams to create
+             HashSet<OutputConfiguration> addSet = new HashSet<OutputConfiguration>(outputs);
+             // Streams to delete
+@@ -714,10 +728,10 @@ public class CameraDeviceImpl extends CameraDevice
+                     }
+ 
+                     if (sessionParams != null) {
+-                        offlineStreamIds = mRemoteDevice.endConfigure(operatingMode,
++                        offlineStreamIds = mRemoteDevice.endConfigure(vendorOperatingMode,
+                                 sessionParams.getNativeCopy(), createSessionStartTime);
+                     } else {
+-                        offlineStreamIds = mRemoteDevice.endConfigure(operatingMode, null,
++                        offlineStreamIds = mRemoteDevice.endConfigure(vendorOperatingMode, null,
+                                 createSessionStartTime);
+                     }
+ 
+@@ -743,7 +757,7 @@ public class CameraDeviceImpl extends CameraDevice
+                     }
+ 
+                     SessionConfiguration sessionConfiguration =
+-                            new SessionConfiguration(operatingMode, configuredOutputs);
++                            new SessionConfiguration(vendorOperatingMode, configuredOutputs);
+                     sessionConfigurationAndStreamIds.sessionConfigurationDelta =
+                             sessionConfiguration;
+                     sessionConfiguration.setSessionParameters(sessionParams);
+-- 
+2.56.0
+
