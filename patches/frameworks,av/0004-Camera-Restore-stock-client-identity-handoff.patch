@@ -1,0 +1,116 @@
+From 61b21beea5530fabdff5434a48cce0c3c891de8b Mon Sep 17 00:00:00 2001
+From: RobertGarciaa <chae0218@naver.com>
+Date: Wed, 11 Nov 2026 13:01:08 +0900
+Subject: [PATCH] Camera: Restore stock client identity handoff before HAL open
+
+Call the pinned beforeConnect member with the validated attribution package and shim-update flag. The stock implementation forwards the package to cameraMDM, which CamX uses to select OEM stream usecases. Preserve extension errors and leave disabled/unavailable extension behavior intact. Requires the cameraserver cameraMDM client policy in camera-guacamole.
+---
+ .../camera/libcameraservice/CameraService.cpp   | 11 +++++++++++
+ .../ext/CameraServiceExtFactory.cpp             | 17 ++++++++++++++++-
+ .../ext/include/CameraServiceExtFactory.h       |  5 +++++
+ 3 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/services/camera/libcameraservice/CameraService.cpp b/services/camera/libcameraservice/CameraService.cpp
+index 85fe863..2860777 100644
+--- a/services/camera/libcameraservice/CameraService.cpp
++++ b/services/camera/libcameraservice/CameraService.cpp
+@@ -2653,6 +2653,17 @@ Status CameraService::connectHelper(const sp<CALLBACK>& cameraCb, const std::str
+             return ret;
+         }
+ 
++        // Preserve the stock client identity handoff before HAL initialization.
++        // validateConnectLocked has checked the caller, and mServiceLock serializes
++        // this handoff with opening the device. Do not forward unvalidated Binder data.
++        int extensionError = CameraServiceExtFactory::beforeConnect(
++                String8(cameraId.c_str()), String16(clientPackageName.c_str()), shimUpdateOnly);
++        if (extensionError != 0) {
++            return STATUS_ERROR_FMT(extensionError,
++                    "OnePlus camera extension rejected connection to camera %s",
++                    cameraId.c_str());
++        }
++
+         // give flashlight a chance to close devices if necessary.
+         mFlashlight->prepareDeviceOpen(cameraId);
+ 
+diff --git a/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+index ccc1326..a0ca780 100644
+--- a/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
++++ b/services/camera/libcameraservice/ext/CameraServiceExtFactory.cpp
+@@ -32,6 +32,7 @@ uid_t CameraThreadState::getCallingUid() {
+ std::once_flag CameraServiceExtFactory::sLoadOnce;
+ void* CameraServiceExtFactory::sFactory = nullptr;
+ void* CameraServiceExtFactory::sExtObject = nullptr;
++int (*CameraServiceExtFactory::sBeforeConnectFunc)(void*, const String8&, const String16&, bool) = nullptr;
+ int (*CameraServiceExtFactory::sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t) = nullptr;
+ 
+ void CameraServiceExtFactory::ensureLoaded() {
+@@ -54,7 +55,11 @@ void CameraServiceExtFactory::ensureLoaded() {
+                 "_ZN7android10ExtFactory19getCameraServiceExtEv"));
+         auto transact = reinterpret_cast<OnTransact>(dlsym(handle,
+                 "_ZN7android20CameraServiceExtImpl10onTransactEjRKNS_6ParcelEPS1_j"));
+-        if (getFactory == nullptr || getExtension == nullptr || transact == nullptr) {
++        using BeforeConnect = int (*)(void*, const String8&, const String16&, bool);
++        auto beforeConnect = reinterpret_cast<BeforeConnect>(dlsym(handle,
++                "_ZN7android20CameraServiceExtImpl13beforeConnectERKNS_7String8ERKNS_8String16Eb"));
++        if (getFactory == nullptr || getExtension == nullptr || transact == nullptr ||
++                beforeConnect == nullptr) {
+             ALOGE("OnePlus camera extension exports are incomplete");
+             dlclose(handle);
+             return;
+@@ -71,6 +76,7 @@ void CameraServiceExtFactory::ensureLoaded() {
+         sFactory = factory;
+         sExtObject = extension;
+         sOnTransactFunc = transact;
++        sBeforeConnectFunc = beforeConnect;
+         // Keep the library loaded: these objects and callbacks belong to its singleton.
+         ALOGI("OnePlus camera extension initialized");
+     });
+@@ -91,6 +97,15 @@ int CameraServiceExtFactory::onTransact(uint32_t code, const Parcel& data,
+     return sOnTransactFunc(sExtObject, code, data, reply, flags);
+ }
+ 
++int CameraServiceExtFactory::beforeConnect(const String8& cameraId,
++        const String16& packageName, bool shimUpdateOnly) {
++    ensureLoaded();
++    if (sExtObject == nullptr || sBeforeConnectFunc == nullptr) return NO_ERROR;
++    // Stock beforeConnect forwards the validated package to cameraMDM. CamX
++    // reads it when selecting OEM stream usecases; onTransact alone cannot do so.
++    return sBeforeConnectFunc(sExtObject, cameraId, packageName, shimUpdateOnly);
++}
++
+ CameraServiceExtFactory::~CameraServiceExtFactory() = default;
+ 
+ } // namespace android
+diff --git a/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h b/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
+index b5dbfed..00fb78d 100644
+--- a/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
++++ b/services/camera/libcameraservice/ext/include/CameraServiceExtFactory.h
+@@ -2,6 +2,8 @@
+ 
+ #include <binder/Parcel.h>
+ #include <utils/Errors.h>
++#include <utils/String8.h>
++#include <utils/String16.h>
+ #include <mutex>
+ 
+ namespace android {
+@@ -11,6 +13,8 @@ public:
+     // Returns the actual stock factory object, owned by the loaded library.
+     static void* getInstance();
+     static int onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags);
++    static int beforeConnect(const String8& cameraId, const String16& packageName,
++            bool shimUpdateOnly);
+     virtual ~CameraServiceExtFactory();
+ 
+ private:
+@@ -18,6 +22,7 @@ private:
+     static std::once_flag sLoadOnce;
+     static void* sFactory;
+     static void* sExtObject;
++    static int (*sBeforeConnectFunc)(void*, const String8&, const String16&, bool);
+     static int (*sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t);
+ };
+ 
+-- 
+2.56.0
+
